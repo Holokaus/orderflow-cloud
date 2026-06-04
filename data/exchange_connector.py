@@ -85,7 +85,6 @@ class ExchangeConnector:
             'avg_latency_ms': 0,
             'last_gap_time': None
         }
-        self._pending_gap: Optional[tuple] = None
         self._last_resync_time: float = 0.0
 
     async def connect(self):
@@ -220,7 +219,6 @@ class ExchangeConnector:
                 }
                 self._last_update_id = snap.get('nonce', 0)
                 self._prev_final_update_id = 0
-                self._pending_gap = None
                 self._health_metrics['resyncs'] += 1
                 logger.info(f"Snapshot loaded: {len(self._local_bids)}b/{len(self._local_asks)}a, lastUpdateId={self._last_update_id} [Resync #{self._health_metrics['resyncs']}]")
                 # Apply buffered events newer than snapshot (lenient - don't require strict bridging)
@@ -243,23 +241,16 @@ class ExchangeConnector:
         event_final_id = data.get('u', 0)
         if event_final_id <= self._last_update_id:
             return False
-        if self._prev_final_update_id == 0:
-            if event_final_id <= self._last_update_id:
-                return False
-        else:
+        if self._prev_final_update_id != 0:
             expected_u = self._prev_final_update_id + 1
             if event_first_id != expected_u:
                 gap_size = event_first_id - expected_u
-                # Fix: small gaps (< 10000) are tolerated with a warning
-                # Large gaps trigger re-sync
-                if gap_size > 10000:
-                    logger.error(f"LARGE GAP: expected U={expected_u}, got U={event_first_id}, gap={gap_size}")
-                    self._health_metrics['gaps_detected'] += 1
-                    self._health_metrics['last_gap_time'] = datetime.now(timezone.utc)
-                    self._book_initialised = False
-                    self._last_resync_time = time.monotonic()
-                    return False
-                logger.warning(f"Small gap: expected U={expected_u}, got U={event_first_id}, gap={gap_size}")
+                self._health_metrics['gaps_detected'] += 1
+                self._health_metrics['last_gap_time'] = datetime.now(timezone.utc)
+                if gap_size > 0:
+                    logger.warning(f"Gap: expected U={expected_u}, got U={event_first_id}, gap={gap_size}")
+                # Tolerate all gaps — apply diff and continue.
+                # A slightly stale book is better than endless re-syncs.
         for price_str, size_str in data.get('b', []):
             price, size = float(price_str), float(size_str)
             if size == 0:
@@ -275,12 +266,6 @@ class ExchangeConnector:
         self._prev_final_update_id = event_final_id
         self._health_metrics['events_applied'] += 1
         return True
-
-    async def _backfill_gap(self, symbol: str):
-        logger.warning("Backfill triggered: Fetching fresh REST snapshot")
-        self._book_initialised = False
-        self._last_resync_time = time.monotonic()
-        await self._fetch_rest_snapshot(symbol)
 
     def _build_sorted_book(self) -> Dict[str, Any]:
         sorted_bids = sorted(
@@ -442,20 +427,13 @@ class ExchangeConnector:
         event_first_id = data.get('U', 0)
         if event_final_id <= self._last_update_id:
             return
-        # Fix: skip out-of-order / duplicate events silently
-        # Binance combined stream can deliver events with U < prev_u after reconnection
+        # Skip out-of-order / duplicate events silently
         if self._prev_final_update_id != 0 and event_first_id <= self._prev_final_update_id:
             self._health_metrics['stale_skipped'] += 1
             return
         applied = self._apply_diff_if_valid(data)
         if not applied:
-            now = time.monotonic()
-            time_since_last_resync = now - self._last_resync_time
-            if time_since_last_resync < 3.0:
-                return
-            self._book_initialised = False
-            self._last_resync_time = now
-            asyncio.create_task(self._backfill_gap(symbol))
+            # Only possible for events older than snapshot — skip silently
             return
         sorted_book = self._build_sorted_book()
         exchange_ts_ms = data.get('E')
