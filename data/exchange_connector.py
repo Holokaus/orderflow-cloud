@@ -247,8 +247,7 @@ class ExchangeConnector:
                 gap_size = event_first_id - expected_u
                 self._health_metrics['gaps_detected'] += 1
                 self._health_metrics['last_gap_time'] = datetime.now(timezone.utc)
-                if gap_size > 0:
-                    logger.warning(f"Gap: expected U={expected_u}, got U={event_first_id}, gap={gap_size}")
+                logger.debug(f"Gap: expected U={expected_u}, got U={event_first_id}, gap={abs(gap_size)}")
                 # Tolerate all gaps — apply diff and continue.
                 # A slightly stale book is better than endless re-syncs.
         for price_str, size_str in data.get('b', []):
