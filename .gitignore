@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+*.db
+logs/
+data/recorded/
+data/backtests/
+results/
+models/
+*.parquet
+*.jsonl
+*.jsonl.gz
