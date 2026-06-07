@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Paper Trading Runner: Post-cooldown Both Strategies (ICP/USDT)
-Railway-optimized: uses native env vars, logs to stderr for Railway capture.
+Railway-optimized: uses native env vars, SIGTERM graceful shutdown.
 """
 import sys
 import os
@@ -21,10 +21,14 @@ from loguru import logger
 logger.remove()
 logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level} | {message}")
 
-
 class PaperSettings(Settings):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+_shutdown_event = asyncio.Event()
+
+def handle_sigterm(*args):
+    logger.info("SIGTERM received, initiating graceful shutdown...")
+    _shutdown_event.set()
 
 settings = PaperSettings(
     trading=TradingConfig(
@@ -45,13 +49,6 @@ settings = PaperSettings(
 
 STRATEGIES = ["absorption", "stacked_imbalance"]
 
-_shutdown_event = asyncio.Event()
-
-
-def handle_sigterm(*args):
-    logger.info("SIGTERM received, initiating graceful shutdown...")
-    _shutdown_event.set()
-
 
 def print_status(system, elapsed_seconds):
     print("\n" + "-" * 60)
@@ -66,7 +63,6 @@ def print_status(system, elapsed_seconds):
     equity = current
     pnl_amount = current - initial
     pnl_pct = (pnl_amount / initial * 100) if initial > 0 else 0
-    pnl_sym = "+" if pnl_amount > 0 else "" if pnl_amount < 0 else " "
     print(f"Equity: ${equity:.2f}")
     print(f"P&L: ${pnl_amount:+.2f} ({pnl_pct:+.2f}%)")
     if system.paper_position:
@@ -76,7 +72,8 @@ def print_status(system, elapsed_seconds):
         print(f"   Entry: ${pos['entry_price']:.4f} | Size: {pos['size']:.4f}")
         print(f"   SL: ${pos['stop_loss']:.4f} | TP: ${pos['take_profit']:.4f}")
         unrealized = pos.get('unrealized_pnl', 0)
-        print(f"   Unrealized: ${unrealized:+.2f}")
+        unrealized_pct = (unrealized / pos.get('allocated', 1)) * 100 if pos.get('allocated') > 0 else 0
+        print(f"   Unrealized: ${unrealized:+.2f} ({unrealized_pct:+.2f}%)")
     else:
         print(f"Position: FLAT (no open trade)")
     num_trades = len(system.paper_closed_trades)
@@ -103,7 +100,7 @@ async def main():
     if not api_key or not api_secret:
         print("\nWARNING: BINANCE_API_KEY or BINANCE_API_SECRET not set")
         print("   Paper trading will run in DATA-ONLY mode (no trading execution)")
-        print("   Set these in Railway dashboard: Variables -> Add Reference\n")
+        print("   Set these in VPS/cloud environment variables.\n")
 
     print("=" * 60)
     print("  PAPER TRADING: Post-cooldown Both Strategies")
@@ -116,17 +113,25 @@ async def main():
     print("=" * 60)
     print("\nConnecting to Binance...\n")
 
-    system._init_components('paper', testnet=False)
+    system._init_components('paper', testnet=False, use_futures=False)
     if system.exchange:
         system.exchange.config.api_key = api_key
         system.exchange.config.api_secret = api_secret
+
+    if system.order_manager and hasattr(system.order_manager, 'fee_filter'):
+        fee_filter = system.order_manager.fee_filter
+        fee_filter.expected_spread = 0.0005
+        fee_filter.total_cost = (
+            fee_filter.entry_fee + fee_filter.exit_fee +
+            fee_filter.expected_spread + fee_filter.min_profit
+        )
 
     start_time = asyncio.get_event_loop().time()
     status_interval = 180
     last_status_time = start_time
 
     try:
-        trading_task = asyncio.create_task(system.run_paper(STRATEGIES, testnet=False))
+        trading_task = asyncio.create_task(system.run_paper(STRATEGIES, testnet=False, use_futures=False))
 
         async def status_monitor():
             nonlocal last_status_time
@@ -139,7 +144,6 @@ async def main():
                 await asyncio.sleep(5)
 
         monitor_task = asyncio.create_task(status_monitor())
-
         shutdown_task = asyncio.create_task(_shutdown_event.wait())
 
         done, pending = await asyncio.wait(
@@ -166,8 +170,7 @@ async def main():
         if "restricted location" in str(e).lower():
             print("\nGEOGRAPHIC RESTRICTION DETECTED:")
             print("   Binance is blocking access from your location.")
-            print("   Railway runs in US/EU regions - this should not happen.")
-            print("   Contact Railway support if issue persists.")
+            print("   VPS in US/EU regions should not have this issue.")
         raise
     finally:
         if system.exchange:
@@ -180,7 +183,6 @@ async def main():
         print("FINAL SUMMARY")
         print("=" * 60)
         print_status(system, elapsed)
-
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_sigterm)
